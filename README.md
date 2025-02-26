@@ -19,7 +19,6 @@ The nwhisper plugin allows you to stream audio from your microphone and send it 
            start_key = '<leader>as',  -- Keybinding to start streaming
            stop_key = '<leader>ap',   -- Keybinding to stop streaming
            whisper_endpoint = 'http://localhost:9001/transcribe',  -- Whisper endpoint URL
-           audio_device = '"Microphone (Realtek High Definition Audio)"'  -- Audio device name
          })
        end,
      },
@@ -40,7 +39,6 @@ require('nwhisper').setup({
   start_key = '<leader>as',  -- Keybinding to start streaming
   stop_key = '<leader>ap',   -- Keybinding to stop streaming
   whisper_endpoint = 'http://localhost:9001/transcribe',  -- Whisper endpoint URL
-  audio_device = '"Microphone (Realtek High Definition Audio)"'  -- Audio device name
 })
 ```
 
@@ -48,8 +46,10 @@ require('nwhisper').setup({
 
 - **Start Streaming:** Press `<leader>as` to start streaming audio and sending it to the Whisper endpoint.
 - **Stop Streaming:** Press `<leader>ap` to stop the audio stream.
+- **Select Audio Device:** Press `<leader>ad` to open a Telescope prompt and select an available audio device.
 
 ## Dependencies
 
 - `ffmpeg`: Ensure that `ffmpeg` is installed on your system.
 - `curl`: Ensure that `curl` is installed on your system.
+- `telescope.nvim`: Ensure that Telescope is installed in your Neovim setup.
