@@ -2,42 +2,280 @@
 local M = {}
 local job_id = nil
 
+--- Detect operating system
+local function is_windows()
+  return package.config:sub(1,1) == '\\'
+end
+
 --- List available audio devices using ffmpeg.
 M.list_audio_devices = function()
-  local cmd = 'ffmpeg -list_devices true -f dshow -i dummy'
-  local handle = io.popen(cmd)
-  local result = handle:read("*a")
-  handle:close()
-
+  local cmd
+  local is_win = is_windows()
+  
+  if is_win then
+    cmd = 'ffmpeg -list_devices true -f dshow -i dummy 2>&1'
+  else
+    cmd = 'ffmpeg -f pulse -list_devices true -i dummy 2>&1'
+  end
+  
+  -- Use vim.fn.system instead of io.popen for better compatibility with Neovim
+  print("Executing command: " .. cmd)
+  local result = vim.fn.system(cmd)
+  
+  if vim.v.shell_error ~= 0 then
+    print("Command executed with non-zero exit code: " .. vim.v.shell_error)
+    -- This is expected as ffmpeg will exit with an error when listing devices
+  end
+  
   local devices = {}
-  for line in result:gmatch("[^\r\n]+") do
-    if line:find("Alternative name") then
-      table.insert(devices, line:match(": \"(.+)\""))
+  
+  if is_win then
+    -- Windows parsing (DirectShow)
+    for line in result:gmatch("[^\r\n]+") do
+      -- Look for lines with "(audio)" which indicate audio devices
+      if line:find("%(audio%)") then
+        -- Extract the device name which is in quotes before "(audio)"
+        local device_name = line:match("\"([^\"]+)\"")
+        if device_name then
+          print("Found Windows audio device: " .. device_name)
+          table.insert(devices, device_name)
+        end
+      end
     end
+  else
+    -- Linux parsing (PulseAudio)
+    for line in result:gmatch("[^\r\n]+") do
+      if line:find("'") and line:find("description") then
+        local device = line:match("'([^']+)'")
+        if device then
+          print("Found Linux PulseAudio device: " .. device)
+          table.insert(devices, device)
+        end
+      end
+    end
+  end
+
+  if #devices == 0 then
+    print("No audio devices found. Trying alternative method...")
+    
+    -- Fallback method for Linux if PulseAudio didn't work
+    if not is_win then
+      cmd = 'ffmpeg -f alsa -list_devices true -i dummy 2>&1'
+      print("Executing fallback command: " .. cmd)
+      result = vim.fn.system(cmd)
+      
+      for line in result:gmatch("[^\r\n]+") do
+        if line:find("'") and (line:find("card") or line:find("device")) then
+          local device = line:match("'([^']+)'")
+          if device then
+            print("Found Linux ALSA device: " .. device)
+            table.insert(devices, device)
+          end
+        end
+      end
+    end
+  end
+
+  if #devices == 0 then
+    print("No audio devices found.")
+  else
+    print("Found " .. #devices .. " audio devices")
   end
 
   return devices
 end
 
---- Start audio streaming and send to Whisper endpoint.
+--- Record a short audio clip and send to Whisper endpoint for transcription.
+M.record_and_transcribe = function()
+  local temp_file = os.tmpname() .. ".wav"
+  local pcm_file = temp_file:gsub("%.wav$", ".pcm")
+  local cmd
+  
+  print("Recording 5 seconds of audio...")
+  
+  if is_windows() then
+    cmd = string.format(
+      'ffmpeg -f dshow -i audio="%s" -ac 1 -ar 16000 -t 5 %s',
+      M.audio_device, temp_file
+    )
+  else
+    local input_format = "pulse"
+    if M.audio_device:find("card") or M.audio_device:find("hw:") then
+      input_format = "alsa"
+    end
+    
+    cmd = string.format(
+      'ffmpeg -f %s -i "%s" -ac 1 -ar 16000 -t 5 %s',
+      input_format, M.audio_device, temp_file
+    )
+  end
+  
+  vim.fn.system(cmd)
+  print("Recording complete. Converting to PCM...")
+  
+  -- Convert to PCM format
+  cmd = string.format(
+    'ffmpeg -i %s -ac 1 -ar 16000 -f s16le %s',
+    temp_file, pcm_file
+  )
+  vim.fn.system(cmd)
+  print("Conversion complete. Transcribing...")
+  
+  -- Build WebSocket URL with query parameters
+  local ws_url = string.format(
+    "ws://%s/v1/audio/transcriptions?model=%s&language=%s&response_format=%s&temperature=%s",
+    M.whisper_endpoint:gsub("^http://", ""),
+    "Systran/faster-distil-whisper-large-v3",
+    "en",
+    "json",
+    "0"
+  )
+  
+  -- Use curl to send the PCM file over WebSocket
+  local curl_cmd
+  if is_windows() then
+    curl_cmd = string.format(
+      'curl -v -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" --data-binary @%s %s',
+      pcm_file, ws_url
+    )
+  else
+    curl_cmd = string.format(
+      'curl -v -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" --data-binary @%s %s',
+      pcm_file, ws_url
+    )
+  end
+  
+  print("Executing WebSocket command: " .. curl_cmd)
+  local result = vim.fn.system(curl_cmd)
+  print("Transcription result: " .. result)
+  
+  -- Try to parse JSON response
+  local text = result
+  if result:match("^{") then
+    local json_text = result:match('"text"%s*:%s*"([^"]*)"')
+    if json_text then
+      text = json_text
+    end
+  end
+  
+  -- Insert the transcribed text at the current cursor position
+  local cursor_pos = vim.api.nvim_win_get_cursor(0)
+  vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {text})
+  
+  -- Clean up temporary files
+  os.remove(temp_file)
+  os.remove(pcm_file)
+  
+  return text
+end
+
+--- Start audio streaming and send to Whisper endpoint using WebSockets.
 M.start_streaming = function()
-  local cmd = string.format('ffmpeg -f dshow -i audio=%s -f wav pipe:1 | curl -X POST %s --data-binary @-', M.audio_device, M.whisper_endpoint)
-  job_id = vim.fn.jobstart(cmd, {
+  -- Create a temporary file for the PCM data
+  local temp_file = os.tmpname() .. ".pcm"
+  
+  -- Record a short audio clip to PCM format
+  local cmd
+  if is_windows() then
+    cmd = string.format(
+      'ffmpeg -f dshow -i audio="%s" -ac 1 -ar 16000 -f s16le -t 3 %s',
+      M.audio_device, temp_file
+    )
+  else
+    local input_format = "pulse"
+    if M.audio_device:find("card") or M.audio_device:find("hw:") then
+      input_format = "alsa"
+    end
+    
+    cmd = string.format(
+      'ffmpeg -f %s -i "%s" -ac 1 -ar 16000 -f s16le -t 3 %s',
+      input_format, M.audio_device, temp_file
+    )
+  end
+  
+  print("Recording audio sample...")
+  vim.fn.system(cmd)
+  print("Recording complete. Starting WebSocket connection...")
+  
+  -- Build WebSocket URL with query parameters
+  local ws_url = string.format(
+    "ws://%s/v1/audio/transcriptions?model=%s&language=%s&response_format=%s&temperature=%s",
+    M.whisper_endpoint:gsub("^http://", ""),
+    "Systran/faster-distil-whisper-large-v3",
+    "en",
+    "json",
+    "0"
+  )
+  
+  -- Use websocat or wscat to send the PCM file over WebSocket
+  local ws_cmd
+  if is_windows() then
+    -- For Windows, use wscat
+    ws_cmd = string.format(
+      'wscat -c "%s" < %s',
+      ws_url, temp_file
+    )
+  else
+    -- For Linux, use websocat
+    ws_cmd = string.format(
+      'websocat "%s" --binary < %s',
+      ws_url, temp_file
+    )
+  end
+  
+  print("Starting WebSocket connection: " .. ws_cmd)
+  
+  job_id = vim.fn.jobstart(ws_cmd, {
     on_stdout = function(_, data)
       if data then
         for _, line in ipairs(data) do
-          local cursor_pos = vim.api.nvim_win_get_cursor(0)
-          vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {line})
+          if line and #line > 0 then
+            print("Received: " .. line)
+            
+            -- Try to parse JSON response
+            local text = line
+            if line:match("^{") then
+              local json_text = line:match('"text"%s*:%s*"([^"]*)"')
+              if json_text then
+                text = json_text
+              end
+            end
+            
+            -- Insert the transcribed text at the current cursor position
+            local cursor_pos = vim.api.nvim_win_get_cursor(0)
+            vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {text})
+            
+            -- Move the cursor to the end of the inserted text
+            vim.api.nvim_win_set_cursor(0, {cursor_pos[1], cursor_pos[2] + #text})
+          end
         end
       end
     end,
     on_stderr = function(_, data)
-      print(vim.inspect(data))
+      if data then
+        for _, line in ipairs(data) do
+          if line and #line > 0 then
+            print("WebSocket error: " .. line)
+          end
+        end
+      end
     end,
     on_exit = function()
+      print("WebSocket connection closed")
+      
+      -- Clean up temporary file
+      os.remove(temp_file)
+      
       job_id = nil
     end,
   })
+  
+  if job_id <= 0 then
+    print("Failed to start WebSocket connection")
+    os.remove(temp_file)
+  else
+    print("WebSocket connection started")
+  end
 end
 
 --- Stop the audio streaming process.
@@ -51,21 +289,30 @@ end
 --- Select an audio device using Telescope.
 M.select_audio_device = function()
   local devices = M.list_audio_devices()
-  require('telescope.builtin').find_files({
+  
+  -- Use the standard Telescope picker instead of fzf which might not be available
+  local pickers = require('telescope.pickers')
+  local finders = require('telescope.finders')
+  local conf = require('telescope.config').values
+  local actions = require('telescope.actions')
+  local action_state = require('telescope.actions.state')
+  
+  pickers.new({}, {
     prompt_title = "Select Audio Device",
-    results_title = "Available Audio Devices",
-    finder = require'telescope.finders'.new_table({results = devices}),
+    finder = finders.new_table({
+      results = devices,
+    }),
+    sorter = conf.generic_sorter({}),
     attach_mappings = function(prompt_bufnr, map)
-      local actions = require 'telescope.actions'
       actions.select_default:replace(function()
         actions.close(prompt_bufnr)
-        local selection = action_state.get_selected_entry().value
+        local selection = action_state.get_selected_entry()[1]
         M.audio_device = selection
         print("Selected audio device: " .. M.audio_device)
       end)
       return true
     end,
-  })
+  }):find()
 end
 
 --- Setup default keybindings and configurations for starting and stopping the streaming process.
@@ -74,12 +321,16 @@ M.setup = function(config)
   config = config or {}
   local start_key = config.start_key or '<leader>as'
   local stop_key = config.stop_key or '<leader>ap'
-  local whisper_endpoint = config.whisper_endpoint or 'http://localhost:9001/transcribe'
+  local select_key = config.select_key or '<leader>ad'
+  local record_key = config.record_key or '<leader>ar'
+  local whisper_endpoint = config.whisper_endpoint or 'http://192.168.178.188:8000'
   local audio_device = config.audio_device or '"Microphone (Realtek High Definition Audio)"'
 
-  vim.api.nvim_set_keymap('n', start_key, ':lua require("nwhisper").start_streaming()<CR>', { noremap = true, silent = true })
-  vim.api.nvim_set_keymap('n', stop_key, ':lua require("nwhisper").stop_streaming()<CR>', { noremap = true, silent = true })
-  vim.api.nvim_set_keymap('n', '<leader>ad', ':lua require("nwhisper").select_audio_device()<CR>', { noremap = true, silent = true })
+  -- Use vim.keymap.set (newer API) instead of vim.api.nvim_set_keymap
+  vim.keymap.set('n', start_key, function() require("nwhisper").start_streaming() end, { desc = 'Start audio streaming' })
+  vim.keymap.set('n', stop_key, function() require("nwhisper").stop_streaming() end, { desc = 'Stop audio streaming' })
+  vim.keymap.set('n', select_key, function() require("nwhisper").select_audio_device() end, { desc = 'Select audio device' })
+  vim.keymap.set('n', record_key, function() require("nwhisper").record_and_transcribe() end, { desc = 'Record and transcribe audio' })
 
   M.whisper_endpoint = whisper_endpoint
   M.audio_device = audio_device
