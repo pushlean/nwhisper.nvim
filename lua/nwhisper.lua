@@ -88,7 +88,6 @@ end
 --- Record a short audio clip and send to Whisper endpoint for transcription.
 M.record_and_transcribe = function()
   local temp_file = os.tmpname() .. ".wav"
-  local pcm_file = temp_file:gsub("%.wav$", ".pcm")
   local cmd
   
   print("Recording 5 seconds of audio...")
@@ -111,142 +110,181 @@ M.record_and_transcribe = function()
   end
   
   vim.fn.system(cmd)
-  print("Recording complete. Converting to PCM...")
+  print("Recording complete. Transcribing...")
   
-  -- Convert to PCM format
-  cmd = string.format(
-    'ffmpeg -i %s -ac 1 -ar 16000 -f s16le %s',
-    temp_file, pcm_file
-  )
-  vim.fn.system(cmd)
-  print("Conversion complete. Transcribing...")
-  
-  -- Build WebSocket URL with query parameters
-  local ws_url = string.format(
-    "ws://%s/v1/audio/transcriptions?model=%s&language=%s&response_format=%s&temperature=%s",
-    M.whisper_endpoint:gsub("^http://", ""),
-    "Systran/faster-distil-whisper-large-v3",
-    "en",
-    "json",
-    "0"
+  -- Build URL for the transcription API (using HTTP POST, not WebSocket)
+  local url = string.format(
+    "%s/v1/audio/transcriptions",
+    M.whisper_endpoint
   )
   
-  -- Use curl to send the PCM file over WebSocket
-  local curl_cmd
-  if is_windows() then
-    curl_cmd = string.format(
-      'curl -v -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" --data-binary @%s %s',
-      pcm_file, ws_url
-    )
-  else
-    curl_cmd = string.format(
-      'curl -v -N -H "Connection: Upgrade" -H "Upgrade: websocket" -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" --data-binary @%s %s',
-      pcm_file, ws_url
-    )
-  end
+  -- Use curl to send the WAV file to the API
+  local curl_cmd = string.format(
+    'curl -X POST %s -F "file=@%s" -F "model=Systran/faster-distil-whisper-large-v3" -F "response_format=text"',
+    url, temp_file
+  )
   
-  print("Executing WebSocket command: " .. curl_cmd)
+  print("Executing transcription command: " .. curl_cmd)
   local result = vim.fn.system(curl_cmd)
   print("Transcription result: " .. result)
   
-  -- Try to parse JSON response
-  local text = result
-  if result:match("^{") then
-    local json_text = result:match('"text"%s*:%s*"([^"]*)"')
-    if json_text then
-      text = json_text
-    end
-  end
-  
   -- Insert the transcribed text at the current cursor position
   local cursor_pos = vim.api.nvim_win_get_cursor(0)
-  vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {text})
+  vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {result})
   
-  -- Clean up temporary files
+  -- Clean up temporary file
   os.remove(temp_file)
-  os.remove(pcm_file)
   
-  return text
+  return result
 end
 
 --- Start audio streaming and send to Whisper endpoint using WebSockets.
 M.start_streaming = function()
-  -- Create a temporary file for the PCM data
-  local temp_file = os.tmpname() .. ".pcm"
+  -- Create a temporary script file
+  local script_file = os.tmpname() .. ".py"
   
-  -- Record a short audio clip to PCM format
-  local cmd
-  if is_windows() then
-    cmd = string.format(
-      'ffmpeg -f dshow -i audio="%s" -ac 1 -ar 16000 -f s16le -t 3 %s',
-      M.audio_device, temp_file
-    )
-  else
-    local input_format = "pulse"
-    if M.audio_device:find("card") or M.audio_device:find("hw:") then
-      input_format = "alsa"
-    end
-    
-    cmd = string.format(
-      'ffmpeg -f %s -i "%s" -ac 1 -ar 16000 -f s16le -t 3 %s',
-      input_format, M.audio_device, temp_file
-    )
-  end
-  
-  print("Recording audio sample...")
-  vim.fn.system(cmd)
-  print("Recording complete. Starting WebSocket connection...")
-  
-  -- Build WebSocket URL with query parameters
-  local ws_url = string.format(
+  -- Write a Python script to handle WebSocket streaming
+  local script_content = [[
+import asyncio
+import websockets
+import sys
+import json
+import subprocess
+import threading
+import queue
+
+# WebSocket URL
+ws_url = "]] .. string.format(
     "ws://%s/v1/audio/transcriptions?model=%s&language=%s&response_format=%s&temperature=%s",
     M.whisper_endpoint:gsub("^http://", ""),
     "Systran/faster-distil-whisper-large-v3",
     "en",
     "json",
     "0"
-  )
+  ) .. [["
+
+# Audio device
+audio_device = "]] .. M.audio_device .. [["
+
+# Queue for audio data
+audio_queue = queue.Queue()
+
+# Function to capture audio
+def capture_audio():
+    if sys.platform == "win32":
+        # Windows
+        cmd = [
+            "ffmpeg", "-loglevel", "quiet", "-f", "dshow", 
+            "-i", f"audio={audio_device}", "-ac", "1", "-ar", "16000", 
+            "-f", "s16le", "-"
+        ]
+    else:
+        # Linux
+        input_format = "pulse"
+        if "card" in audio_device or "hw:" in audio_device:
+            input_format = "alsa"
+        
+        cmd = [
+            "ffmpeg", "-loglevel", "quiet", "-f", input_format, 
+            "-i", audio_device, "-ac", "1", "-ar", "16000", 
+            "-f", "s16le", "-"
+        ]
+    
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    
+    try:
+        while True:
+            # Read audio data in chunks
+            chunk = process.stdout.read(8000)  # 0.25 seconds of audio at 16kHz, 16-bit mono
+            if not chunk:
+                break
+            audio_queue.put(chunk)
+    except Exception as e:
+        print(f"Error capturing audio: {e}", file=sys.stderr)
+    finally:
+        process.terminate()
+        process.wait()
+
+# Start audio capture in a separate thread
+def start_audio_capture():
+    thread = threading.Thread(target=capture_audio)
+    thread.daemon = True
+    thread.start()
+    return thread
+
+# Main WebSocket client
+async def websocket_client():
+    print("Connecting to WebSocket...")
+    async with websockets.connect(ws_url) as websocket:
+        print("WebSocket connected")
+        
+        # Start audio capture
+        audio_thread = start_audio_capture()
+        
+        # Send audio data
+        send_task = asyncio.create_task(send_audio(websocket))
+        
+        # Receive transcription
+        receive_task = asyncio.create_task(receive_transcription(websocket))
+        
+        # Wait for both tasks to complete
+        await asyncio.gather(send_task, receive_task)
+
+# Send audio data to WebSocket
+async def send_audio(websocket):
+    try:
+        while True:
+            try:
+                # Get audio chunk from queue with timeout
+                chunk = audio_queue.get(timeout=1)
+                await websocket.send(chunk)
+            except queue.Empty:
+                # No audio data available, continue
+                await asyncio.sleep(0.1)
+    except websockets.exceptions.ConnectionClosed:
+        print("WebSocket connection closed")
+
+# Receive transcription from WebSocket
+async def receive_transcription(websocket):
+    try:
+        async for message in websocket:
+            try:
+                # Try to parse as JSON
+                data = json.loads(message)
+                if "text" in data:
+                    print(data["text"])
+            except json.JSONDecodeError:
+                # Not JSON, print as is
+                print(message)
+    except websockets.exceptions.ConnectionClosed:
+        print("WebSocket connection closed")
+
+# Run the WebSocket client
+asyncio.run(websocket_client())
+]]
+
+  -- Write the script to a file
+  local script_handle = io.open(script_file, "w")
+  script_handle:write(script_content)
+  script_handle:close()
   
-  -- Use websocat or wscat to send the PCM file over WebSocket
-  local ws_cmd
-  if is_windows() then
-    -- For Windows, use wscat
-    ws_cmd = string.format(
-      'wscat -c "%s" < %s',
-      ws_url, temp_file
-    )
-  else
-    -- For Linux, use websocat
-    ws_cmd = string.format(
-      'websocat "%s" --binary < %s',
-      ws_url, temp_file
-    )
-  end
+  -- Execute the Python script
+  local cmd = string.format("python %s", script_file)
+  print("Starting WebSocket streaming with Python: " .. cmd)
   
-  print("Starting WebSocket connection: " .. ws_cmd)
-  
-  job_id = vim.fn.jobstart(ws_cmd, {
+  job_id = vim.fn.jobstart(cmd, {
     on_stdout = function(_, data)
       if data then
         for _, line in ipairs(data) do
           if line and #line > 0 then
-            print("Received: " .. line)
-            
-            -- Try to parse JSON response
-            local text = line
-            if line:match("^{") then
-              local json_text = line:match('"text"%s*:%s*"([^"]*)"')
-              if json_text then
-                text = json_text
-              end
-            end
+            print("Transcription: " .. line)
             
             -- Insert the transcribed text at the current cursor position
             local cursor_pos = vim.api.nvim_win_get_cursor(0)
-            vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {text})
+            vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {line})
             
             -- Move the cursor to the end of the inserted text
-            vim.api.nvim_win_set_cursor(0, {cursor_pos[1], cursor_pos[2] + #text})
+            vim.api.nvim_win_set_cursor(0, {cursor_pos[1], cursor_pos[2] + #line})
           end
         end
       end
@@ -255,26 +293,26 @@ M.start_streaming = function()
       if data then
         for _, line in ipairs(data) do
           if line and #line > 0 then
-            print("WebSocket error: " .. line)
+            print("Python error: " .. line)
           end
         end
       end
     end,
     on_exit = function()
-      print("WebSocket connection closed")
+      print("WebSocket streaming stopped")
       
       -- Clean up temporary file
-      os.remove(temp_file)
+      os.remove(script_file)
       
       job_id = nil
     end,
   })
   
   if job_id <= 0 then
-    print("Failed to start WebSocket connection")
-    os.remove(temp_file)
+    print("Failed to start WebSocket streaming")
+    os.remove(script_file)
   else
-    print("WebSocket connection started")
+    print("WebSocket streaming started")
   end
 end
 
