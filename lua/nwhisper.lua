@@ -140,6 +140,11 @@ end
 
 --- Start audio streaming and send to Whisper endpoint using WebSockets.
 M.start_streaming = function()
+  -- Keep track of the last inserted text and position
+  local last_text = ""
+  local start_line = 0
+  local start_col = 0
+  
   -- Build WebSocket URL with query parameters
   local ws_url = string.format(
     "ws://%s/v1/audio/transcriptions?model=%s&language=%s&response_format=%s&temperature=%s",
@@ -153,7 +158,7 @@ M.start_streaming = function()
   -- Create a single command that captures audio directly to PCM and pipes it to the WebSocket
   local cmd
   if is_windows() then
-    -- For Windows, use ffmpeg to capture audio directly to PCM and pipe to wscat
+    -- For Windows, use ffmpeg to capture audio directly to PCM and pipe to websocat
     cmd = string.format(
       'ffmpeg -loglevel quiet -f dshow -i audio="%s" -ac 1 -ar 16000 -f s16le - | ' ..
       'websocat --binary "%s"',
@@ -175,6 +180,11 @@ M.start_streaming = function()
   
   print("Starting WebSocket streaming: " .. cmd)
   
+  -- Get the current cursor position to start inserting text
+  local cursor_pos = vim.api.nvim_win_get_cursor(0)
+  start_line = cursor_pos[1] - 1
+  start_col = cursor_pos[2]
+  
   job_id = vim.fn.jobstart(cmd, {
     on_stdout = function(_, data)
       if data then
@@ -186,13 +196,31 @@ M.start_streaming = function()
             if line:match("^{") then
               local json_text = line:match('"text"%s*:%s*"([^"]*)"')
               if json_text then
-                -- Insert the transcribed text at the current cursor position
-                local cursor_pos = vim.api.nvim_win_get_cursor(0)
-                vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {json_text})
+                -- Replace the previous text with the new text
+                if #last_text > 0 then
+                  -- Delete the previous text
+                  vim.api.nvim_buf_set_text(0, start_line, start_col, start_line, start_col + #last_text, {""})
+                end
                 
-                -- Move the cursor to the end of the inserted text
-                vim.api.nvim_win_set_cursor(0, {cursor_pos[1], cursor_pos[2] + #json_text})
+                -- Insert the new text
+                vim.api.nvim_buf_set_text(0, start_line, start_col, start_line, start_col, {json_text})
+                
+                -- Update the last inserted text
+                last_text = json_text
               end
+            else
+              -- If not JSON, try to use the line as is
+              -- Replace the previous text with the new text
+              if #last_text > 0 then
+                -- Delete the previous text
+                vim.api.nvim_buf_set_text(0, start_line, start_col, start_line, start_col + #last_text, {""})
+              end
+              
+              -- Insert the new text
+              vim.api.nvim_buf_set_text(0, start_line, start_col, start_line, start_col, {line})
+              
+              -- Update the last inserted text
+              last_text = line
             end
           end
         end
