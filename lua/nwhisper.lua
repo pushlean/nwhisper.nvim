@@ -149,7 +149,7 @@ M.start_streaming = function()
   local ws_url = string.format(
     "ws://%s/v1/audio/transcriptions?model=%s&language=%s&response_format=%s&temperature=%s",
     M.whisper_endpoint:gsub("^http://", ""),
-    "Systran/faster-distil-whisper-large-v3",
+    "Systran/faster-whisper-large-v3",
     "en",
     "json",
     "0"
