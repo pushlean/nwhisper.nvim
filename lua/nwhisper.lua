@@ -156,7 +156,7 @@ M.start_streaming = function()
     -- For Windows, use ffmpeg to capture audio directly to PCM and pipe to wscat
     cmd = string.format(
       'ffmpeg -loglevel quiet -f dshow -i audio="%s" -ac 1 -ar 16000 -f s16le - | ' ..
-      'wscat -c "%s"',
+      'websocat --binary "%s"',
       M.audio_device, ws_url
     )
   else
