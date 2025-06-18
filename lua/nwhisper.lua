@@ -7,7 +7,7 @@ local function is_windows()
   return package.config:sub(1,1) == '\\'
 end
 
---- List available audio devices using ffmpeg.
+--- List available audio devices (uses ffmpeg on Windows, arecord on Linux).
 M.list_audio_devices = function()
   local cmd
   local is_win = is_windows()
@@ -15,7 +15,8 @@ M.list_audio_devices = function()
   if is_win then
     cmd = 'ffmpeg -list_devices true -f dshow -i dummy 2>&1'
   else
-    cmd = 'ffmpeg -f pulse -list_devices true -i dummy 2>&1'
+    -- Use arecord to list ALSA capture devices on Linux
+    cmd = 'arecord -l 2>&1'
   end
   
   -- Use vim.fn.system instead of io.popen for better compatibility with Neovim
@@ -43,14 +44,15 @@ M.list_audio_devices = function()
       end
     end
   else
-    -- Linux parsing (PulseAudio)
+    -- Linux parsing (arecord -l)
+    -- Example line: "card 2: Webcam [C922 Pro Stream Webcam], device 0: USB Audio [USB Audio]"
     for line in result:gmatch("[^\r\n]+") do
-      if line:find("'") and line:find("description") then
-        local device = line:match("'([^']+)'")
-        if device then
-          print("Found Linux PulseAudio device: " .. device)
-          table.insert(devices, device)
-        end
+      local card_id = line:match("^card%s+(%d+):")
+      local device_id = line:match("device%s+(%d+):")
+      if card_id and device_id then
+        local device_str = string.format("hw:%s,%s", card_id, device_id)
+        print("Found Linux ALSA device: " .. device_str)
+        table.insert(devices, device_str)
       end
     end
   end
@@ -58,26 +60,11 @@ M.list_audio_devices = function()
   if #devices == 0 then
     print("No audio devices found. Trying alternative method...")
     
-    -- Fallback method for Linux if PulseAudio didn't work
-    if not is_win then
-      cmd = 'ffmpeg -f alsa -list_devices true -i dummy 2>&1'
-      print("Executing fallback command: " .. cmd)
-      result = vim.fn.system(cmd)
-      
-      for line in result:gmatch("[^\r\n]+") do
-        if line:find("'") and (line:find("card") or line:find("device")) then
-          local device = line:match("'([^']+)'")
-          if device then
-            print("Found Linux ALSA device: " .. device)
-            table.insert(devices, device)
-          end
-        end
-      end
+    -- No additional fallback necessary on Linux; arecord should always be present.
+    -- If no devices were parsed, users may need to install ALSA utilities.
+    if not is_win and #devices == 0 then
+      print("arecord did not return any capture devices. Ensure ALSA utilities are installed and the system has capture devices.")
     end
-  end
-
-  if #devices == 0 then
-    print("No audio devices found.")
   else
     print("Found " .. #devices .. " audio devices")
   end
@@ -120,7 +107,7 @@ M.record_and_transcribe = function()
   
   -- Use curl to send the WAV file to the API
   local curl_cmd = string.format(
-    'curl -X POST %s -F "file=@%s" -F "model=Systran/faster-distil-whisper-large-v3" -F "response_format=text"',
+    'curl -X POST %s -F "file=@%s" -F "model=whisper-1" -F "response_format=text"',
     url, temp_file
   )
   
