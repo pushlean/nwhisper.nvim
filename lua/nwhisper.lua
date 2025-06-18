@@ -105,9 +105,11 @@ M.record_and_transcribe = function()
     M.whisper_endpoint
   )
   
-  -- Use curl to send the WAV file to the API
+  -- Use -sS to disable the progress meter (which is written to stderr) while still
+  -- showing an error message if the request fails. This keeps the `result` value
+  -- clean, containing only the transcription text returned by the server.
   local curl_cmd = string.format(
-    'curl -X POST %s -F "file=@%s" -F "model=whisper-1" -F "response_format=text"',
+    'curl -sS -X POST %s -F "file=@%s" -F "model=whisper-1" -F "response_format=text"',
     url, temp_file
   )
   
@@ -115,9 +117,19 @@ M.record_and_transcribe = function()
   local result = vim.fn.system(curl_cmd)
   print("Transcription result: " .. result)
   
-  -- Insert the transcribed text at the current cursor position
+  -- Insert the transcribed text at the current cursor position. If the result
+  -- contains newlines we should respect them, so we split the string into
+  -- individual lines before inserting.
   local cursor_pos = vim.api.nvim_win_get_cursor(0)
-  vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], {result})
+  -- `vim.split` returns a table which can directly be supplied to
+  -- nvim_buf_set_text. Use a plain "\n" delimiter so we do not interpret lua
+  -- patterns, then trim a potential trailing blank line that appears when the
+  -- string ends in a newline.
+  local lines = vim.split(result, "\n", { plain = true })
+  if lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  vim.api.nvim_buf_set_text(0, cursor_pos[1] - 1, cursor_pos[2], cursor_pos[1] - 1, cursor_pos[2], lines)
   
   -- Clean up temporary file
   os.remove(temp_file)
