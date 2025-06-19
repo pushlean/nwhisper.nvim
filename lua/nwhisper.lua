@@ -1,6 +1,8 @@
 -- nwhisper.lua
 local M = {}
 local job_id = nil
+local record_job_id = nil
+local record_temp_file = nil
 
 --- Detect operating system
 local function is_windows()
@@ -74,30 +76,54 @@ end
 
 --- Record a short audio clip and send to Whisper endpoint for transcription.
 M.record_and_transcribe = function()
-  local temp_file = os.tmpname() .. ".wav"
-  local cmd
-  
-  print("Recording 5 seconds of audio...")
-  
-  if is_windows() then
-    cmd = string.format(
-      'ffmpeg -f dshow -i audio="%s" -ac 1 -ar 16000 -t 5 %s',
-      M.audio_device, temp_file
-    )
-  else
-    local input_format = "pulse"
-    if M.audio_device:find("card") or M.audio_device:find("hw:") then
-      input_format = "alsa"
+  -- Toggle behaviour: if we are not currently recording, start; otherwise stop and transcribe
+  if not record_job_id then
+    -- Start recording (indefinitely until stopped)
+    record_temp_file = os.tmpname() .. ".wav"
+
+    local cmd
+
+    if is_windows() then
+      -- Windows uses dshow. Omitting the -t option records until the process is stopped
+      cmd = string.format(
+        'ffmpeg -y -loglevel quiet -f dshow -i audio="%s" -ac 1 -ar 16000 -acodec pcm_s16le "%s"',
+        M.audio_device,
+        record_temp_file
+      )
+    else
+      -- Determine whether to use PulseAudio or ALSA
+      local input_format = "pulse"
+      if M.audio_device:find("card") or M.audio_device:find("hw:") then
+        input_format = "alsa"
+      end
+
+      cmd = string.format(
+        'ffmpeg -y -loglevel quiet -f %s -i "%s" -ac 1 -ar 16000 -acodec pcm_s16le "%s"',
+        input_format,
+        M.audio_device,
+        record_temp_file
+      )
     end
-    
-    cmd = string.format(
-      'ffmpeg -f %s -i "%s" -ac 1 -ar 16000 -t 5 %s',
-      input_format, M.audio_device, temp_file
-    )
+
+    print("Starting audio recording. Invoke the same command again to stop and transcribe…")
+    record_job_id = vim.fn.jobstart(cmd, { detach = true })
+
+    if record_job_id <= 0 then
+      print("Failed to start recording")
+      record_job_id = nil
+    else
+      print("Recording started (job ID: " .. record_job_id .. ")")
+    end
+    return
   end
-  
-  vim.fn.system(cmd)
-  print("Recording complete. Transcribing...")
+
+  -- We are currently recording → stop and transcribe
+  print("Stopping recording and starting transcription…")
+  vim.fn.jobstop(record_job_id)
+  record_job_id = nil
+
+  local temp_file = record_temp_file
+  record_temp_file = nil
   
   -- Build URL for the transcription API (using HTTP POST, not WebSocket)
   local url = string.format(
