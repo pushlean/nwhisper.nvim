@@ -105,21 +105,20 @@ M.record_and_transcribe = function()
       )
     end
 
-    print("Starting audio recording. Invoke the same command again to stop and transcribe…")
     record_job_id = vim.fn.jobstart(cmd, { detach = true })
 
     if record_job_id <= 0 then
       print("Failed to start recording")
       record_job_id = nil
-    else
-      print("Recording started (job ID: " .. record_job_id .. ")")
     end
     return
   end
 
   -- We are currently recording → stop and transcribe
-  print("Stopping recording and starting transcription…")
   vim.fn.jobstop(record_job_id)
+  -- Wait for the (now-terminated) job to fully exit so that the temporary file is flushed
+  -- Use -1 timeout to wait indefinitely; this call returns immediately if the job is already dead
+  vim.fn.jobwait({record_job_id}, -1)
   record_job_id = nil
 
   local temp_file = record_temp_file
@@ -139,9 +138,7 @@ M.record_and_transcribe = function()
     url, temp_file
   )
   
-  print("Executing transcription command: " .. curl_cmd)
   local result = vim.fn.system(curl_cmd)
-  print("Transcription result: " .. result)
   
   -- Insert the transcribed text at the current cursor position. If the result
   -- contains newlines we should respect them, so we split the string into
